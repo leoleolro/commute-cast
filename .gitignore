@@ -1,0 +1,6 @@
+config.json
+episodes/
+content/
+episodes.json
+node_modules/
+.DS_Store

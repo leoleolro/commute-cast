@@ -1,0 +1,17 @@
+{
+  "name": "commute-cast",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Turn anything into a private podcast you can listen to on the way to work.",
+  "bin": {
+    "pod": "./bin/pod"
+  },
+  "scripts": {
+    "serve": "node bin/pod serve"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": "github.com:leoleolro/commute-cast"
+}

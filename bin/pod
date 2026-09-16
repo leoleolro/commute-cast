@@ -1,0 +1,422 @@
+#!/usr/bin/env node
+// commute-cast — turn anything into a private podcast.
+
+import path from 'node:path';
+import { writeFile, copyFile, mkdir, readdir, unlink, stat, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { renderScript, missingVoices } from '../src/tts.js';
+import { koreanEpisode } from '../src/sources/korean.js';
+import { wordsEpisode } from '../src/sources/words.js';
+import { readingEpisode } from '../src/sources/reading.js';
+import { digestEpisode } from '../src/sources/digest.js';
+import { claudeEpisode, listSessions, listProjects } from '../src/sources/claude.js';
+import { editToScript, editorAvailable, FORMAT_NAMES } from '../src/editor.js';
+import { loadConfig, loadEpisodes, addEpisode, removeEpisode, makeId, EPISODES_DIR, ART_DIR, ROOT } from '../src/store.js';
+import { setLexicon } from '../src/speakable.js';
+import { coverPng } from '../src/cover.js';
+import { hhmmss } from '../src/feed.js';
+import { serve } from '../src/server.js';
+import { setup, DEFAULT_MODELS, fetchVoiceIndex } from '../src/install.js';
+import { installedModels, piperInstalled } from '../src/engines.js';
+
+const run = promisify(execFile);
+
+const [, , command, ...rest] = process.argv;
+
+const flags = {};
+const args = [];
+for (let i = 0; i < rest.length; i++) {
+  const a = rest[i];
+  if (a.startsWith('--')) {
+    const [key, inline] = a.slice(2).split('=');
+    if (inline !== undefined) flags[key] = inline;
+    else if (rest[i + 1] && !rest[i + 1].startsWith('--')) flags[key] = rest[++i];
+    else flags[key] = true;
+  } else args.push(a);
+}
+
+const bold = (s) => `\x1b[1m${s}\x1b[0m`;
+const dim = (s) => `\x1b[2m${s}\x1b[0m`;
+const ok = (s) => `\x1b[32m${s}\x1b[0m`;
+const live = process.stdout.isTTY;
+
+function die(message) {
+  console.error(`\x1b[31m${message}\x1b[0m`);
+  process.exit(1);
+}
+
+// --- shared render path ----------------------------------------------------
+async function publish(spec) {
+  const config = await loadConfig();
+
+  const problems = await missingVoices(config.voices);
+  if (problems.length) die(`Can't render yet:\n  ${problems.join('\n  ')}`);
+
+  await mkdir(EPISODES_DIR, { recursive: true });
+  await mkdir(ART_DIR, { recursive: true });
+
+  const date = new Date();
+  const id = makeId(spec.show, spec.title, date);
+  const file = `${id}.m4a`;
+  const outFile = path.join(EPISODES_DIR, file);
+
+  const spoken = spec.segments.filter((s) => s.say).length;
+  process.stdout.write(`Rendering ${bold(spec.title)} ${dim(`(${spoken} segments)`)} `);
+  const started = Date.now();
+  const { duration } = await renderScript(spec, {
+    outFile,
+    voices: config.voices,
+    bitrate: config.bitrate,
+    onProgress: live ? (done, total) => {
+      process.stdout.write(`\rRendering ${bold(spec.title)} ${dim(`(${done}/${total} segments)`)} `);
+    } : undefined,
+  });
+  const { size } = await stat(outFile);
+
+  for (const [name, seed] of [[spec.show, spec.show], ['commute-cast', config.title]]) {
+    const cover = path.join(ART_DIR, `${name}.png`);
+    if (!existsSync(cover)) await writeFile(cover, coverPng(seed));
+  }
+
+  await addEpisode({
+    id, show: spec.show, title: spec.title, description: spec.description || '',
+    file, bytes: size, duration, pubDate: date.toISOString(),
+  });
+
+  console.log(`\r${ok('✓')} ${bold(spec.title)}${' '.repeat(24)}`);
+  console.log(`  ${hhmmss(duration)} · ${(size / 1024 / 1024).toFixed(1)} MB · rendered in ${((Date.now() - started) / 1000).toFixed(0)}s`);
+  if (flags.sync) await cmdSync();
+  return id;
+}
+
+/** Run source material through the editor, then render it. */
+async function publishDigest(source, { context, note = '', show = 'digest', fallbackTitle }) {
+  if (!(await editorAvailable())) die('The `claude` CLI is not available, so digest mode cannot run.');
+  const config = await loadConfig();
+  const format = flags.format || config.editor?.format || 'brief';
+  if (!FORMAT_NAMES.includes(format)) die(`Unknown format "${format}" — try ${FORMAT_NAMES.join(', ')}`);
+  const minutes = Number(flags.minutes) || config.editor?.minutes || 8;
+
+  process.stdout.write(dim(`  editing… `));
+  const script = await editToScript(source, {
+    format,
+    minutes,
+    model: flags.model || config.editor?.model || 'sonnet',
+    context,
+    onStage: (s) => process.stdout.write(live ? `\r  ${dim(`${s}…`)}${' '.repeat(30)}` : ''),
+  });
+  console.log(`\r  ${dim(`${format}, ${script.lines.length} lines`)}${' '.repeat(30)}`);
+
+  if (!script.title || script.title === 'Untitled') script.title = fallbackTitle || 'Digest';
+  return publish(digestEpisode(script, { show, sourceNote: note }));
+}
+
+// --- commands --------------------------------------------------------------
+async function cmdSetup() {
+  const models = flags.models ? String(flags.models).split(',').map((s) => s.trim()) : DEFAULT_MODELS;
+  console.log(bold('\nSetting up neural voices\n'));
+  const t = Date.now();
+  await setup({ models, log: (m) => console.log(m) });
+  console.log(`\n${ok('✓')} done in ${((Date.now() - t) / 1000 / 60).toFixed(1)} min. Voices are local, offline and free.\n`);
+}
+
+async function cmdVoices() {
+  const installed = await installedModels();
+  console.log(bold('\nInstalled voice models\n'));
+  installed.forEach((m) => console.log(`  ${m}`));
+  if (!installed.length) console.log(dim('  none — run: pod setup'));
+  if (!flags.all) return console.log(dim('\n  pod voices --all   list everything downloadable\n'));
+
+  const index = await fetchVoiceIndex();
+  const wanted = String(flags.lang || 'en_US,ko_KR').split(',');
+  console.log(bold('\nAvailable to download\n'));
+  Object.keys(index)
+    .filter((k) => wanted.some((w) => k.startsWith(w)) && /medium|high/.test(k))
+    .forEach((k) => console.log(`  ${installed.includes(k) ? ok('✓') : ' '} ${k}`));
+  console.log(dim('\n  pod setup --models en_US-amy-medium,ko_KR-kss-medium\n'));
+}
+
+/**
+ * Switch the narrator voice, and render a side-by-side sample to choose from.
+ *
+ * Picking a voice is a listening decision, not a reading one, so this exists to
+ * make the comparison cheap: `pod voice --try` writes one short sample per
+ * installed English model into a folder you can play straight through.
+ */
+async function cmdVoice() {
+  const config = await loadConfig();
+  const installed = (await installedModels()).filter((m) => m.startsWith('en_'));
+
+  if (flags.try) {
+    const { synthesize } = await import('../src/engines.js');
+    const { wavFromPcm } = await import('../src/wav.js');
+    const { mkdtemp } = await import('node:fs/promises');
+    const out = path.join(homedir(), 'Desktop', 'voice-samples');
+    await mkdir(out, { recursive: true });
+    const tmp = await mkdtemp(path.join(tmpdir(), 'voice-'));
+    const text = typeof flags.try === 'string' ? flags.try
+      : "Here's the headline. Revo Fitness is the standout growth story in an Australian gym market that is otherwise going sideways. Memberships start at 9 dollars 69 a week, and the industry is worth about 3.7 billion dollars.";
+    const sentences = text.split(/(?<=[.!?])\s+/);
+    for (const model of installed) {
+      const clips = await synthesize({ engine: 'piper', model, sentenceSilence: 0.28 }, sentences, tmp);
+      const wav = path.join(tmp, `${model}.wav`);
+      await writeFile(wav, wavFromPcm(Buffer.concat(clips)));
+      await run('afconvert', ['-f', 'm4af', '-d', 'aac', '-b', '64000', wav, path.join(out, `${model}.m4a`)]);
+      console.log(`  ${ok('✓')} ${model}`);
+    }
+    console.log(dim(`\n  ${out}\n  Then: pod voice <model>\n`));
+    // Picking a voice means listening to them, so put the folder in front of
+    // him rather than leaving a path to go and find.
+    await run('open', [out]).catch(() => {});
+    return;
+  }
+
+  const pick = args[0];
+  if (!pick) {
+    console.log(bold('\nNarrator voice\n'));
+    for (const m of installed) {
+      console.log(`  ${m === config.voices.narrator.model ? ok('●') : '○'} ${m}`);
+    }
+    console.log(dim('\n  pod voice --try            render a sample of each to the Desktop'));
+    console.log(dim('  pod voice en_GB-cori-high  switch to that one\n'));
+    return;
+  }
+
+  const model = installed.find((m) => m === pick || m.includes(pick));
+  if (!model) die(`No installed voice matching "${pick}". Try: pod voices --all`);
+  for (const role of ['narrator', 'host', 'en']) {
+    if (config.voices[role]) config.voices[role] = { ...config.voices[role], model };
+  }
+  if (config.voices.en_slow) config.voices.en_slow = { ...config.voices.en_slow, model };
+  await writeFile(path.join(ROOT, 'config.json'), `${JSON.stringify(config, null, 2)}\n`);
+  console.log(`${ok('✓')} narrator is now ${bold(model)}`);
+}
+
+async function cmdDigest() {
+  let source;
+  let context = '';
+  let note = '';
+  let fallbackTitle;
+
+  if (args[0] === '-' || (!args.length && !process.stdin.isTTY)) {
+    source = await new Promise((res) => {
+      let s = '';
+      process.stdin.setEncoding('utf8').on('data', (d) => { s += d; }).on('end', () => res(s));
+    });
+    fallbackTitle = 'Pasted note';
+  } else if (args[0] && existsSync(args[0])) {
+    source = await readFile(args[0], 'utf8');
+    fallbackTitle = path.basename(args[0]).replace(/\.[^.]+$/, '');
+    context = `This came from a file called ${fallbackTitle}.`;
+    note = `Source: ${args[0]}`;
+  } else if (args.length) {
+    source = args.join(' ');
+    fallbackTitle = 'Note';
+  } else {
+    die('Usage: pod digest <file>   |   pod digest "some text"   |   cat x.md | pod digest -');
+  }
+  await publishDigest(source, { context, note, fallbackTitle });
+}
+
+async function cmdClaude() {
+  let dir;
+  if (typeof flags.project === 'string') {
+    const projects = await listProjects();
+    const match = projects.find((p) => p.name.toLowerCase().includes(flags.project.toLowerCase()));
+    if (!match) die(`No Claude project matching "${flags.project}".\n${projects.map((p) => `  ${p.name}`).join('\n')}`);
+    dir = match.dir;
+  }
+
+  const sessions = await listSessions(dir);
+  if (!sessions.length) die('No Claude sessions found.');
+
+  if (flags.list) {
+    console.log(bold('\nRecent Claude sessions\n'));
+    sessions.slice(0, 15).forEach((s, i) => {
+      console.log(`  ${String(i + 1).padStart(2)}. ${s.title.slice(0, 62)}`);
+      console.log(dim(`      ${s.modified.toISOString().slice(0, 10)} · ${s.turns} turns · ${s.id.slice(0, 8)}`));
+    });
+    console.log(dim('\n  pod claude --pick 2\n'));
+    return;
+  }
+
+  const picked = flags.session
+    ? sessions.find((s) => s.id.startsWith(String(flags.session)))
+    : sessions[(Number(flags.pick) || 1) - 1];
+  if (!picked) die('No matching session. Try: pod claude --list');
+
+  console.log(dim(`  session: ${picked.title.slice(0, 60)} (${picked.modified.toISOString().slice(0, 10)})`));
+  const spec = await claudeEpisode(picked.file, { code: 'skip', includePrompts: !flags.raw });
+
+  // Verbatim readout is still available, but it is no longer the default —
+  // hearing a transcript read out loud is not the same as understanding it.
+  if (flags.raw) {
+    return publish({
+      ...spec,
+      title: picked.title.slice(0, 70),
+      description: `${spec.answers} answers from ${picked.modified.toDateString()}.\n${spec.notes}`.slice(0, 4000),
+    });
+  }
+
+  const source = spec.segments.filter((s) => s.say).map((s) => s.say).join('\n\n');
+  await publishDigest(source, {
+    show: 'claude',
+    context: `This is a working session with Claude from ${picked.modified.toDateString()}, titled "${picked.title}". `
+      + `Explain what was actually figured out and built, not the blow-by-blow.`,
+    note: `From a Claude session on ${picked.modified.toDateString()}.`,
+    fallbackTitle: picked.title.slice(0, 70),
+  });
+}
+
+async function cmdKorean() {
+  const deck = args[0] || 'content/korean.md';
+  if (!existsSync(deck)) die(`No deck at ${deck}`);
+  await publish(await koreanEpisode(deck, {
+    mode: flags.review ? 'review' : 'learn',
+    repeats: Number(flags.repeats) || 1,
+  }));
+}
+
+async function cmdWords() {
+  const deck = args[0] || 'content/words.md';
+  if (!existsSync(deck)) die(`No deck at ${deck}`);
+  await publish(await wordsEpisode(deck, { recall: Number(flags.recall) || 2.2 }));
+}
+
+/**
+ * A ready-written spoken script straight to an episode, and onto the phone.
+ *
+ * This is the landing pad for the /brief skill: the research and the writing
+ * happen in Claude Code, which has the web tools, and the result arrives here
+ * as a script that is already meant to be heard. No editor pass, no markdown
+ * gymnastics — just render and sync.
+ */
+async function cmdBrief() {
+  const file = args[0];
+  if (!file || !existsSync(file)) die('Usage: pod brief <script.md> [--title "..."] [--no-sync]');
+  const id = await publish(await readingEpisode(file, {
+    title: typeof flags.title === 'string' ? flags.title : undefined,
+    code: 'skip',
+    show: 'brief',
+  }));
+  if (flags.sync === undefined && flags['no-sync'] === undefined) await cmdSync();
+  return id;
+}
+
+async function cmdRead() {
+  const file = args[0];
+  if (!file || !existsSync(file)) die('Usage: pod read <file>');
+  await publish(await readingEpisode(file, {
+    title: typeof flags.title === 'string' ? flags.title : undefined,
+    code: flags.code === 'mention' ? 'mention' : 'skip',
+  }));
+}
+
+async function cmdList() {
+  const [config, episodes] = [await loadConfig(), await loadEpisodes()];
+  if (!episodes.length) return console.log(dim('No episodes yet. Try: pod claude'));
+  console.log(bold(`\n${episodes.length} episode${episodes.length === 1 ? '' : 's'}\n`));
+  let total = 0;
+  for (const e of episodes) {
+    total += e.duration;
+    console.log(`  ${e.title.slice(0, 58)}`);
+    console.log(dim(`    ${config.shows[e.show]?.title || e.show} · ${hhmmss(e.duration)} · ${e.id}`));
+  }
+  console.log(dim(`\n  ${hhmmss(total)} total\n`));
+}
+
+async function cmdRemove() {
+  if (!args[0]) die('Usage: pod rm <episode-id>');
+  const removed = await removeEpisode(args[0]);
+  console.log(removed ? `${ok('✓')} removed ${removed.title}` : 'No episode matched that id.');
+}
+
+async function cmdSync(explicitTarget) {
+  const [config, episodes] = [await loadConfig(), await loadEpisodes()];
+  // iCloud Drive is the only path that reliably lands files in the iPhone's
+  // Files app. Podcast apps fetch feeds from their own servers and can never
+  // see a LAN feed, so this — not the RSS feed — is the delivery route.
+  const folder = config.sync?.folder || 'claudecode';
+  const defaultTarget = path.join(homedir(), 'Library', 'Mobile Documents', 'com~apple~CloudDocs', folder);
+  const target = explicitTarget || (typeof flags.to === 'string' ? flags.to : null) || defaultTarget;
+  if (!episodes.length) die('No episodes to sync yet.');
+  await mkdir(target, { recursive: true });
+
+  const wanted = new Map();
+  for (const e of episodes) {
+    const show = (config.shows[e.show]?.title || e.show).replace(/[/:]/g, '-');
+    wanted.set(`${e.pubDate.slice(0, 10)} ${show} — ${e.title.replace(/[/:]/g, '-').slice(0, 60)}.m4a`, e);
+  }
+
+  let copied = 0;
+  for (const [name, e] of wanted) {
+    const dest = path.join(target, name);
+    if (existsSync(dest)) continue;
+    await copyFile(path.join(EPISODES_DIR, e.file), dest);
+    copied++;
+  }
+  if (flags.prune) {
+    for (const name of await readdir(target)) {
+      if (name.endsWith('.m4a') && !wanted.has(name)) await unlink(path.join(target, name));
+    }
+  }
+  console.log(`${ok('✓')} synced ${copied} new (${wanted.size} total)`);
+  console.log(dim(`  ${target}`));
+  if (target === defaultTarget) {
+    console.log(dim(`  iPhone: Files → iCloud Drive → ${folder}`));
+    console.log(dim('  Long-press the folder → Keep Downloaded, to hold it on the phone.'));
+  }
+}
+
+async function cmdServe() {
+  const { port, lan, bonjour } = await serve({ port: Number(flags.port) || undefined });
+  const episodes = await loadEpisodes();
+  console.log(bold('\n  Commute Cast is live\n'));
+  console.log(`  Player     ${ok(`http://${bonjour}:${port}`)}`);
+  console.log(`             ${dim(`http://${lan}:${port}`)}`);
+  console.log(`  Feed       ${ok(`http://${bonjour}:${port}/feed.xml`)}`);
+  console.log(dim(`\n  ${episodes.length} episodes · same wifi only · ctrl-c to stop\n`));
+}
+
+function usage() {
+  console.log(`
+${bold('commute-cast')} — turn anything into a private podcast
+
+  ${bold('pod setup')}                  install the neural voices ${dim('(once, ~5 min, free)')}
+
+  ${bold('pod digest')} <file|text|->    anything, rewritten for listening
+  ${bold('pod claude')}                  your latest Claude session, digested ${dim('--list --pick 2 --raw')}
+  ${bold('pod korean')} <deck.md>        Korean lesson ${dim('--review --repeats 2')}
+  ${bold('pod words')} <deck.md>         vocabulary drill ${dim('--recall 3')}
+  ${bold('pod read')} <file>             verbatim readout, no editing
+  ${bold('pod brief')} <script.md>      a written script → episode → phone ${dim('(auto-syncs)')}
+
+  ${dim('on any of the above:')}  --format brief|dialogue|lesson   --minutes 12   --sync
+
+  ${bold('pod list')} · ${bold('pod rm')} <id> · ${bold('pod voices')} ${dim('--all')}
+  ${bold('pod voice')} ${dim('--try')}             hear every installed voice, then pick one
+  ${bold('pod serve')} ${dim('--port 4000')} · ${bold('pod sync')} ${dim('[folder] --prune')}
+`);
+}
+
+const commands = {
+  setup: cmdSetup, voices: cmdVoices, voice: cmdVoice, digest: cmdDigest, claude: cmdClaude,
+  korean: cmdKorean, words: cmdWords, read: cmdRead, brief: cmdBrief,
+  list: cmdList, rm: cmdRemove, remove: cmdRemove, serve: cmdServe, sync: cmdSync,
+};
+
+const runCommand = commands[command];
+if (!runCommand) {
+  usage();
+  process.exit(command && !['help', '--help', '-h'].includes(command) ? 1 : 0);
+}
+// Episode sources normalise text while they build segments, which happens
+// before publish() runs — so the lexicon has to be in place before dispatch.
+loadConfig()
+  .then((c) => setLexicon(c.lexicon))
+  .catch(() => {})
+  .then(() => runCommand(command === 'sync' ? args[0] : undefined))
+  .catch((err) => die(err.message));

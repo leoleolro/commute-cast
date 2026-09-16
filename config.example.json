@@ -1,0 +1,88 @@
+{
+  "title": "Commute Cast",
+  "author": "Your Name",
+  "description": "Korean lessons, vocabulary drills, and things I'd rather listen to than read.",
+  "language": "en-us",
+  "port": 4000,
+  "bitrate": 64000,
+  "voices": {
+    "narrator": {
+      "engine": "piper",
+      "model": "en_US-lessac-high",
+      "sentenceSilence": 0.28
+    },
+    "host": {
+      "engine": "piper",
+      "model": "en_US-lessac-high",
+      "sentenceSilence": 0.28
+    },
+    "guest": {
+      "engine": "piper",
+      "model": "en_GB-cori-high",
+      "sentenceSilence": 0.28
+    },
+    "en": {
+      "engine": "piper",
+      "model": "en_US-lessac-high",
+      "sentenceSilence": 0.28
+    },
+    "en_slow": {
+      "engine": "piper",
+      "model": "en_US-lessac-high",
+      "sentenceSilence": 0.28,
+      "lengthScale": 1.2
+    },
+    "ko": {
+      "engine": "piper",
+      "model": "ko_KR-kss-medium"
+    },
+    "ko_slow": {
+      "engine": "piper",
+      "model": "ko_KR-kss-medium",
+      "lengthScale": 1.45
+    }
+  },
+  "shows": {
+    "korean": {
+      "title": "Korean Lessons",
+      "description": "Listen, then repeat after the slow reading."
+    },
+    "words": {
+      "title": "Word of the Day",
+      "description": "Vocabulary drills with a pause to recall."
+    },
+    "claude": {
+      "title": "Claude Readouts",
+      "description": "Chat answers read aloud so I can rest my eyes."
+    },
+    "reading": {
+      "title": "Reading Pile",
+      "description": "Articles, notes and docs, read aloud."
+    },
+    "digest": {
+      "title": "Digest",
+      "description": "Anything, rewritten for listening."
+    },
+    "brief": {
+      "title": "Business Briefings",
+      "description": "Company and market analysis, written to be listened to."
+    }
+  },
+  "editor": {
+    "format": "brief",
+    "minutes": 8,
+    "model": "sonnet"
+  },
+  "lexicon": {
+    "Revo": "Reevo",
+    "Bunnings": "Bunings",
+    "Xiaohongshu": "Shao hong shoo",
+    "Clearview": "Clear view",
+    "KPMG": "K P M G",
+    "EPBCS": "E P B C S",
+    "EDMCS": "E D M C S"
+  },
+  "sync": {
+    "folder": "commute-cast"
+  }
+}
