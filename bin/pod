@@ -19,8 +19,8 @@ import { setLexicon } from '../src/speakable.js';
 import { coverPng } from '../src/cover.js';
 import { hhmmss } from '../src/feed.js';
 import { serve } from '../src/server.js';
-import { setup, DEFAULT_MODELS, fetchVoiceIndex } from '../src/install.js';
-import { installedModels, piperInstalled } from '../src/engines.js';
+import { setup, setupKokoro, DEFAULT_MODELS, fetchVoiceIndex } from '../src/install.js';
+import { installedModels, piperInstalled, kokoroInstalled, KOKORO_HOME, kokoroPython } from '../src/engines.js';
 
 const run = promisify(execFile);
 
@@ -116,6 +116,13 @@ async function publishDigest(source, { context, note = '', show = 'digest', fall
 
 // --- commands --------------------------------------------------------------
 async function cmdSetup() {
+  if (flags.kokoro) {
+    console.log(bold('\nSetting up Kokoro (the natural-sounding voice)\n'));
+    const t = Date.now();
+    await setupKokoro({ log: (m) => console.log(dim(m)) });
+    console.log(`\n${ok('✓')} done in ${((Date.now() - t) / 60000).toFixed(1)} min. Try: pod voice --try\n`);
+    return;
+  }
   const models = flags.models ? String(flags.models).split(',').map((s) => s.trim()) : DEFAULT_MODELS;
   console.log(bold('\nSetting up neural voices\n'));
   const t = Date.now();
@@ -146,9 +153,29 @@ async function cmdVoices() {
  * make the comparison cheap: `pod voice --try` writes one short sample per
  * installed English model into a folder you can play straight through.
  */
+// The English Kokoro voices, best-rated first. The voice pack holds 54, but
+// listing all of them turns choosing into a chore.
+const KOKORO_EN = [
+  ['af_heart', 'American female — warmest'],
+  ['af_bella', 'American female'],
+  ['af_nicole', 'American female — softer, slower'],
+  ['af_sarah', 'American female'],
+  ['am_michael', 'American male'],
+  ['am_fenrir', 'American male — deeper'],
+  ['bf_emma', 'British female'],
+  ['bf_isabella', 'British female'],
+  ['bm_george', 'British male'],
+  ['bm_fable', 'British male'],
+];
+
 async function cmdVoice() {
   const config = await loadConfig();
-  const installed = (await installedModels()).filter((m) => m.startsWith('en_'));
+  const haveKokoro = await kokoroInstalled();
+  const piperModels = (await installedModels()).filter((m) => m.startsWith('en_'));
+  const installed = [
+    ...(haveKokoro ? KOKORO_EN.map(([v, note]) => ({ engine: 'kokoro', id: v, note })) : []),
+    ...piperModels.map((m) => ({ engine: 'piper', id: m, note: 'piper — older, more robotic' })),
+  ];
 
   if (flags.try) {
     const { synthesize } = await import('../src/engines.js');
@@ -160,12 +187,17 @@ async function cmdVoice() {
     const text = typeof flags.try === 'string' ? flags.try
       : "Here's the headline. Revo Fitness is the standout growth story in an Australian gym market that is otherwise going sideways. Memberships start at 9 dollars 69 a week, and the industry is worth about 3.7 billion dollars.";
     const sentences = text.split(/(?<=[.!?])\s+/);
-    for (const model of installed) {
-      const clips = await synthesize({ engine: 'piper', model, sentenceSilence: 0.28 }, sentences, tmp);
-      const wav = path.join(tmp, `${model}.wav`);
+    const only = typeof flags.engine === 'string' ? flags.engine : null;
+    for (const v of installed.filter((x) => !only || x.engine === only)) {
+      const role = v.engine === 'kokoro'
+        ? { engine: 'kokoro', voice: v.id }
+        : { engine: 'piper', model: v.id, sentenceSilence: 0.28 };
+      const clips = await synthesize(role, sentences, tmp);
+      const wav = path.join(tmp, `${v.id}.wav`);
       await writeFile(wav, wavFromPcm(Buffer.concat(clips)));
-      await run('afconvert', ['-f', 'm4af', '-d', 'aac', '-b', '64000', wav, path.join(out, `${model}.m4a`)]);
-      console.log(`  ${ok('✓')} ${model}`);
+      await run('afconvert', ['-f', 'm4af', '-d', 'aac', '-b', '64000', wav,
+        path.join(out, `${v.engine}-${v.id}.m4a`)]);
+      console.log(`  ${ok('✓')} ${v.engine}  ${v.id}`);
     }
     console.log(dim(`\n  ${out}\n  Then: pod voice <model>\n`));
     // Picking a voice means listening to them, so put the folder in front of
@@ -174,23 +206,43 @@ async function cmdVoice() {
     return;
   }
 
+  const current = config.voices.narrator.voice || config.voices.narrator.model;
   const pick = args[0];
   if (!pick) {
     console.log(bold('\nNarrator voice\n'));
-    for (const m of installed) {
-      console.log(`  ${m === config.voices.narrator.model ? ok('●') : '○'} ${m}`);
+    for (const v of installed) {
+      console.log(`  ${v.id === current ? ok('●') : '○'} ${v.id.padEnd(26)} ${dim(v.note)}`);
     }
-    console.log(dim('\n  pod voice --try            render a sample of each to the Desktop'));
-    console.log(dim('  pod voice en_GB-cori-high  switch to that one\n'));
+    console.log(dim('\n  pod voice --try                          a sample of each, opens in Finder'));
+    console.log(dim('  pod voice af_bella                       switch to that one'));
+    console.log(dim('  pod voice af_bella --speed 0.92          slower, more relaxed'));
+    console.log(dim('  pod voice "af_bella*0.7+af_nicole*0.3"   blend two voices\n'));
     return;
   }
 
-  const model = installed.find((m) => m === pick || m.includes(pick));
-  if (!model) die(`No installed voice matching "${pick}". Try: pod voices --all`);
-  for (const role of ['narrator', 'host', 'en']) {
-    if (config.voices[role]) config.voices[role] = { ...config.voices[role], model };
+  const speed = Number(flags.speed) || 1.0;
+
+  // A blend — "af_bella*0.7+af_nicole*0.3" — is a kokoro voice too; it just
+  // isn't in the list, so it's matched by shape rather than by name.
+  const isBlend = /[*+]/.test(pick);
+  const found = isBlend
+    ? { engine: 'kokoro', id: pick }
+    : installed.find((v) => v.id === pick || v.id.includes(pick));
+  if (!found) die(`No installed voice matching "${pick}". Try: pod voice`);
+
+  const role = found.engine === 'kokoro'
+    ? { engine: 'kokoro', voice: found.id, speed }
+    : { engine: 'piper', model: found.id, sentenceSilence: 0.28,
+        ...(speed !== 1 ? { lengthScale: 1 / speed } : {}) };
+  for (const r of ['narrator', 'host', 'en']) {
+    if (config.voices[r]) config.voices[r] = { ...role };
   }
-  if (config.voices.en_slow) config.voices.en_slow = { ...config.voices.en_slow, model };
+  if (config.voices.en_slow) {
+    config.voices.en_slow = found.engine === 'kokoro'
+      ? { ...role, speed: speed * 0.8 }
+      : { ...role, lengthScale: 1.2 };
+  }
+  const model = speed === 1 ? found.id : `${found.id} at ${speed}x`;
   await writeFile(path.join(ROOT, 'config.json'), `${JSON.stringify(config, null, 2)}\n`);
   console.log(`${ok('✓')} narrator is now ${bold(model)}`);
 }
@@ -354,8 +406,15 @@ async function cmdSync(explicitTarget) {
   let copied = 0;
   for (const [name, e] of wanted) {
     const dest = path.join(target, name);
-    if (existsSync(dest)) continue;
-    await copyFile(path.join(EPISODES_DIR, e.file), dest);
+    const src = path.join(EPISODES_DIR, e.file);
+    // Re-rendering an episode keeps its title and date, so the destination
+    // name is unchanged. Comparing size and mtime is what makes a re-render
+    // actually reach the phone instead of silently being skipped.
+    if (existsSync(dest)) {
+      const [a, b] = [await stat(src), await stat(dest)];
+      if (a.size === b.size && a.mtimeMs <= b.mtimeMs) continue;
+    }
+    await copyFile(src, dest);
     copied++;
   }
   if (flags.prune) {
@@ -385,7 +444,7 @@ function usage() {
   console.log(`
 ${bold('commute-cast')} — turn anything into a private podcast
 
-  ${bold('pod setup')}                  install the neural voices ${dim('(once, ~5 min, free)')}
+  ${bold('pod setup')} ${dim('--kokoro')}         install the voices ${dim('(once, free, offline)')}
 
   ${bold('pod digest')} <file|text|->    anything, rewritten for listening
   ${bold('pod claude')}                  your latest Claude session, digested ${dim('--list --pick 2 --raw')}

@@ -8,10 +8,27 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
 
 const run = promisify(execFile);
 
-const CLAUDE = process.env.CLAUDE_BIN || 'claude'; // Claude Code CLI on PATH, or set CLAUDE_BIN
+// Resolve the `claude` CLI rather than hardcoding a path: a spawned process
+// does not inherit an interactive shell's PATH, so plain 'claude' can fail even
+// when the command works fine in a terminal. Check the usual install locations,
+// then fall back to whatever PATH we do have.
+const CLAUDE = (() => {
+  if (process.env.COMMUTE_CAST_CLAUDE) return process.env.COMMUTE_CAST_CLAUDE;
+  const candidates = [
+    path.join(homedir(), '.local', 'lib', 'node', 'bin', 'claude'),
+    path.join(homedir(), '.claude', 'local', 'claude'),
+    path.join(homedir(), '.bun', 'bin', 'claude'),
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+  ];
+  return candidates.find((c) => existsSync(c)) || 'claude';
+})();
 
 // Claude Code loads project settings, MCP servers and CLAUDE.md by default,
 // which is all irrelevant here and costs seconds per call. Strip it back to a

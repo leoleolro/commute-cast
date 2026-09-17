@@ -1,6 +1,23 @@
+# Your own config: voice choice, lexicon, sync folder. config.example.json is
+# the tracked template, and is used as a fallback when this file is absent.
 config.json
+config.local.json
+
+# Rendered episodes and their manifest. These are personal — an episode made
+# from a Claude Code session contains whatever was in that session, and the
+# manifest stores each episode's full script as its description.
 episodes/
-content/
 episodes.json
+
+# Source material and briefings stay local; the two sample decks are tracked
+# so a fresh clone has something to run.
+content/*
+!content/korean.md
+!content/words.md
+
 node_modules/
 .DS_Store
+
+# Python bytecode from the kokoro helper
+__pycache__/
+*.pyc

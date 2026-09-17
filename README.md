@@ -1,258 +1,183 @@
 # Commute Cast
 
-> Install: `git clone https://github.com/leoleolro/commute-cast.git && cd commute-cast && cp config.example.json config.json && ./bin/pod setup`. Requires Node 18+ and macOS (Piper TTS runs offline; iPhone sync uses iCloud Drive). Edit `config.json` for voices, port and the sync folder.
-
-
 Turn anything into a private podcast you can listen to on the way to work —
-Claude sessions, articles, notes, Korean lessons, vocabulary drills.
+research, articles, notes, Claude Code sessions, language decks.
 
-Everything runs on this Mac. No API keys, no subscriptions, no accounts,
-nothing uploaded. Once set up it works with the wifi off.
+Everything runs on your own machine. No API keys, no subscriptions, no accounts,
+nothing uploaded. Once it's set up it works with the wifi off.
 
-## Setup, once
+Two parts of this are worth stealing even if you never run the whole thing:
+
+- **[`src/install.js`](src/install.js) patches a broken Piper wheel on macOS.** The
+  published `piper-tts` wheel hardcodes its CI machine's `espeak-ng-data` path into
+  `espeakbridge.so` and ignores the path you pass to `initialize()`. No environment
+  variable overrides it, so phonemization fails on every machine but the build
+  runner's. The fix rewrites the baked-in string in place and re-signs the binary,
+  which arm64 requires. See [the gory details](#the-piper-wheel-is-broken-on-macos).
+- **[`src/pronounce.js`](src/pronounce.js) makes written text survive being spoken.**
+  Neural TTS is only as good as the text you hand it, and prose written for the eye
+  is full of notation that reads terribly aloud. Every rule in there was found by
+  phonemizing real documents and reading back what the phonemizer actually produced.
+  See [Saying it properly](#saying-it-properly).
+
+## Setup
 
 ```bash
-cd commute-cast
-./bin/pod setup
+./bin/pod setup --kokoro
 ```
 
-`pod` is also installed at `~/.local/bin/pod`, so after opening a new terminal you
-can just type `pod` from anywhere — no `cd`, no `./bin/`.
+Two engines, both free and both fully offline:
 
-About 45 seconds. It builds a private Python environment under
-`~/.local/share/commute-cast`, installs **Piper** — a neural text-to-speech
-engine that runs offline — and downloads three voices: an English female, an
-English male, and a Korean one. Delete that one folder to undo all of it.
+- **Kokoro** *(default)* — a 2024 model, and the reason this sounds like a person
+  rather than a train announcement. 54 voices, and they can be blended. Needs
+  Python 3.12, which `uv` fetches into your home directory — no Homebrew, no sudo,
+  nothing system-wide. About 400 MB all in.
+- **Piper** — small and very fast (~13× realtime vs Kokoro's ~2×), and it has the
+  Korean model the language decks use. Noticeably more robotic for long listening.
 
-The old macOS `say` voices are still supported as a fallback, but they are the
-reason this needed doing.
+```bash
+./bin/pod setup            # piper only, ~45s
+./bin/pod setup --kokoro   # kokoro, a few minutes
+```
+
+Everything lives under `~/.local/share/commute-cast`. Delete that one folder to
+undo all of it.
 
 ## The commands that matter
 
 ```bash
-./bin/pod brief script.md        # a written script → episode → straight to the phone
-./bin/pod claude --sync          # your last Claude session, digested, onto your phone
-./bin/pod digest article.md      # any file, rewritten for listening
+pod brief script.md        # a written script → episode → straight to the phone
+pod digest article.md      # any file, rewritten for listening
+pod read notes.md          # verbatim readout, no editing
+pod claude --sync          # your last Claude Code session, digested
 ```
 
-`pod brief` syncs on its own. `--sync` does the same for the others. Everything
-lands in **iCloud Drive → <sync folder from config.json>**, which is the folder that shows up in Files
-on the iPhone. Long-press it there and choose *Keep Downloaded* to hold the
-episodes on the phone itself, so they play with no signal.
+`pod brief` syncs on its own; `--sync` does the same for the others.
 
-## Business briefings, end to end
+## Getting it onto a phone
 
-In Claude Code, just ask:
+Episodes land in **iCloud Drive → `claudecode`**, which shows up in the Files app.
+Long-press the folder there and choose *Keep Downloaded* to hold them on the device
+so they play with no signal.
 
-> business analysis on Revo Fitness
+```bash
+pod sync            # copy everything across
+pod sync --prune    # and delete what's no longer in the library
+```
 
-The `brief` skill does the research, writes the report, rewrites it for the ear,
-renders it and drops it on the phone. The written report is kept next to the
-script under `content/reports/`.
+Change the folder name under `sync.folder` in `config.json`.
+
+This is the route that works. Podcast apps like Overcast and Pocket Casts fetch
+feeds from *their* servers, so they can never reach a feed served from your laptop.
+There is a local player and RSS feed (`pod serve`) if you want it, but it only works
+on the same wifi, and Apple Podcasts is the only app that will add it by URL.
 
 ## Choosing a voice
 
 ```bash
-pod voice --try                  # a sample of every installed voice, opens in Finder
-pod voice cori                   # switch the narrator to that one
+pod voice                  # what's installed, and what's selected
+pod voice --try            # a sample of each, opens in Finder
+pod voice af_bella         # switch
 ```
 
-The default is `en_US-lessac-high`. `pod voices --all` lists everything
-downloadable; `pod setup --models <name>` fetches one.
+Two levers matter more than picking a different name:
+
+```bash
+pod voice af_bella --speed 0.92            # slower reads as more relaxed
+pod voice "af_bella*0.7+af_nicole*0.3"     # blend two voices
+```
+
+Kokoro takes a style vector as happily as a voice name, so a weighted blend gives a
+character neither voice has alone. `af_nicole` is the soft, breathy one, so mixing a
+little into a clearer voice warms it up without losing diction. Weights don't have to
+sum to 1 — higher totals push harder.
 
 ## Saying it properly
 
-Neural voices only sound good if the text is right. Written notation is not, and
-`src/pronounce.js` fixes it — all of it found by phonemizing real reports and
-reading back what espeak actually produced:
+A neural voice is only as good as the text handed to it, and written notation is not
+that text. These are real failures, found by phonemizing documents and reading back
+the IPA rather than by guessing:
 
-| written | espeak said | now says |
+| written | the phonemizer said | now says |
 |---|---|---|
 | `$9.69` | dollar nine point six nine | nine dollars sixty nine |
-| `$3.7bn` | dollar three point seven bee-en | three point seven billion dollars |
-| `24/7` | twenty four slash seven | twenty four seven |
-| `1,800 sqm` | ess-cue-em | square metres |
-| `71-77` | seventy one dash seventy seven | seventy one to seventy seven |
+| `$3.7bn` | dollar three point seven **bee-en** | three point seven billion dollars |
+| `24/7` | twenty four **slash** seven | twenty four seven |
+| `1,800 sqm` | **ess-cue-em** | square metres |
+| `71-77` | seventy one **dash** seventy seven | seventy one to seventy seven |
 | `2026` | two thousand twenty six | twenty twenty six |
-| `WA` / `NSW` | wah / en-ess-double-you | Western Australia / New South Wales |
-| `vs` | vee ess | versus |
-| `—` | dash | *(a pause)* |
+| `WA` / `NSW` | **wah** / en-ess-double-you | Western Australia / New South Wales |
+| `vs` | **vee ess** | versus |
+| `YoY` | **yo why** | year on year |
+| `—` | **dash** | *(a pause)* |
 
-Names it still gets wrong go in `lexicon` in `config.json`, as a respelling
-rather than phonetics — `"Revo": "Reevo"` is the whole trick.
+The trick is rewriting the *notation*, not spelling out every number — the phonemizer
+reads plain integers and decimals correctly on its own, so `$3.7bn` only has to become
+`3.7 billion dollars` and the voice does the rest.
+
+Names it still gets wrong go in `lexicon` in `config.json`, as a **respelling** rather
+than phonetics — steering the phonemizer's own letter rules is far more robust than
+hand-written IPA:
+
+```json
+"lexicon": { "Revo": "Reevo", "EBITDA": "ee bit dah" }
+```
 
 ## Digested, not read out
 
-The point is not a robot reading markdown at you. Source material goes through
-the `claude` CLI already installed on this Mac — using the Claude Code login you
-already have, so it costs nothing extra — and comes back as a script written to
-be *heard*: it leads with the conclusion, drops the file paths and code blocks,
-speaks numbers as words, and signposts before it lists.
-
-Three formats:
+The point is not a robot reading markdown at you. `pod digest` runs source material
+through the `claude` CLI already on your machine — using your existing Claude Code
+login, so it costs nothing extra — and gets back a script written to be *heard*: it
+leads with the conclusion, drops the file paths and code blocks, speaks numbers as
+words, and signposts before it lists.
 
 | `--format` | what you get |
 |---|---|
 | `brief` *(default)* | one narrator, tight, leads with the conclusion |
-| `dialogue` | two voices, a real back-and-forth — best when you're half-awake |
+| `dialogue` | two voices, a real back-and-forth |
 | `lesson` | a tutor taking one idea at a time |
 
 ```bash
-./bin/pod claude --format dialogue --minutes 12
-./bin/pod digest notes.md --format lesson --minutes 6
+pod digest notes.md --format dialogue --minutes 12
 ```
 
-Very long sources (a three-thousand-turn session) are condensed in parallel
-chunks first, then written from the notes.
+If you already have a script written for listening, `pod brief` skips the editor
+entirely and just renders it. That's the path [`examples/brief`](examples/brief)
+uses, where the writing happens in Claude Code instead.
 
-Want the old verbatim readout? `./bin/pod claude --raw`, or `./bin/pod read <file>`.
+## The Piper wheel is broken on macOS
 
-## Everything it takes as input
+Worth writing down, because it cost a day and the error message tells you nothing.
 
-```bash
-./bin/pod claude                 # latest Claude Code session
-./bin/pod claude --list          # pick a different one
-./bin/pod claude --pick 3
-./bin/pod claude --project shopify
+The published `piper-tts` macOS wheel bakes the build machine's `espeak-ng-data`
+path — something under `/Users/runner/work/piper1-gpl` — directly into
+`espeakbridge.so`, and **ignores the path passed to `initialize()`**. There is no
+environment variable that overrides it; `ESPEAK_DATA_PATH` does nothing. So
+phonemization fails on every machine except the CI runner that built it.
 
-./bin/pod digest report.md       # a file
-./bin/pod digest "some text"     # a line
-pbpaste | ./bin/pod digest -     # whatever's on your clipboard
+The fix in `src/install.js`: copy the bundled data somewhere stable, overwrite the
+baked-in string in the binary with that path — NUL-padded, because it cannot grow —
+and re-sign with `codesign -f -s -`, which arm64 refuses to load without. Don't
+simplify that step away; nothing else works.
 
-./bin/pod korean content/korean.md    # study decks, unchanged
-./bin/pod words content/words.md
-```
+Kokoro sidesteps this entirely by using `espeakng-loader`, which ships its own copy.
 
-## Getting it onto the iPhone
+## Notes
 
-### 1. iCloud Drive — most reliable
+- Everything is mono 16-bit PCM at 22.05 kHz, so joining clips is just concatenating
+  bytes — no ffmpeg, no sox. Kokoro renders at 24 kHz and is resampled on the way out
+  with `afconvert`. Don't skip that: mixing rates silently shifts the pitch and breaks
+  the pause timing.
+- `afconvert` caps at 64 kbps for 22.05 kHz mono. 96 kbps fails with
+  `Couldn't set audio converter property ('!dat')`.
+- `pod claude` reads your Claude Code transcripts from `~/.claude/projects`. Whatever
+  was in a session ends up in the episode and in `episodes.json`, which is why both
+  are gitignored.
+- macOS `say` is still supported as a last-ditch fallback, and is the reason this
+  needed building in the first place.
 
-```bash
-./bin/pod sync
-```
+## Licence
 
-Or add `--sync` to any command above. On the phone: **Files → iCloud Drive →
-Commute Cast**, long-press the folder, **Keep Downloaded**. Plays with proper
-lock-screen and AirPods controls, works with no signal, no server needed.
-
-### 2. Apple Podcasts by feed URL — best listening experience
-
-In the **Podcasts app on this Mac**: *File → Add a Show by URL* →
-
-```
-http://<your-mac>.local:4000/feed.xml
-```
-
-Needs `./bin/pod serve` running. With iCloud *Sync Library* on it appears on
-your iPhone and downloads on-device over your home wifi. Per-show feeds exist
-too: `/feed/claude.xml`, `/feed/korean.xml`, `/feed/words.xml`, `/feed/digest.xml`.
-
-**Overcast and Pocket Casts can't subscribe to this** — they fetch feeds on
-their own servers, which can't reach your home wifi. Apple Podcasts fetches
-on-device, which is why it's the one recommended.
-
-Use the `.local` name, not an IP. Your Mac's IP moves on DHCP; the feed rewrites
-its own URLs from the request host to survive that.
-
-### 3. The web player
-
-`http://<your-mac>.local:4000` in Safari on the same wifi. Tap ▶,
-or ⤓ to save an episode into Files.
-
-## Study decks
-
-Plain markdown you can edit on your phone. `#` names the deck, `##` starts a
-section, `>` adds a note, every other line is a card with `|` between fields.
-
-**Korean** — `korean | english | romanization`:
-
-```markdown
-# Survival Korean
-## Coffee and food
-커피 한 잔 주세요. | One coffee, please. | keo-pi han jan ju-se-yo
-```
-
-Plays as **English → gap → slow Korean → a gap the length of the phrase →
-Korean at speed**. The English comes first so you get a beat to try producing it
-before you hear the answer. Romanization stays out of the audio — an English
-voice reading "keo-pi ju-se-yo" teaches the wrong sounds — but stays in the notes.
-`--review` flips to Korean-first recall; `--repeats 2` says it twice.
-
-**Words** — `word | definition | example`. Word, a silence long enough to
-actually try, then the answer. `--recall 3` lengthens the gap.
-
-## Commands
-
-| | |
-|---|---|
-| `pod setup` | install the neural voices (once) |
-| `pod digest <file\|text\|->` | anything, rewritten for listening |
-| `pod claude` | latest Claude session · `--list --pick 2 --raw --project X` |
-| `pod korean` / `pod words` | study decks |
-| `pod read <file>` | verbatim readout, no editing |
-| `pod voices --all` | see and install other voices |
-| `pod list` / `pod rm <id>` | manage episodes |
-| `pod serve` / `pod sync` | feed on wifi / copy to iCloud |
-
-Shared flags: `--format brief\|dialogue\|lesson`, `--minutes 12`, `--sync`,
-`--to <folder>`, `--model haiku`.
-
-## Other voices
-
-`pod voices --all` lists what's downloadable — about twenty English options and
-a Korean one. Install extras and point `config.json` at them:
-
-```bash
-./bin/pod setup --models en_US-amy-medium,en_GB-alba-medium
-```
-
-```json
-"voices": {
-  "narrator": { "engine": "piper", "model": "en_US-hfc_female-medium" },
-  "guest":    { "engine": "piper", "model": "en_US-ryan-high" },
-  "ko_slow":  { "engine": "piper", "model": "ko_KR-kss-medium", "lengthScale": 1.45 }
-}
-```
-
-`lengthScale` above 1 slows a voice down. To fall back to a macOS voice for a
-role, use `{ "engine": "say", "voice": "Samantha", "rate": 178 }`.
-
-## How it works
-
-Every engine emits mono 16-bit PCM at 22050 Hz — true of `say
---data-format=LEI16@22050` and of every Piper model — so clips are joined by
-concatenating sample bytes. No ffmpeg, no mixing library, nothing to install.
-`afconvert`, built into macOS, packs the result to AAC.
-
-Segments are grouped by voice and synthesized in one process per voice, because
-loading a model costs about a second and a lesson has seventy lines. A 15-minute
-episode renders in about a minute; Piper runs roughly 13× faster than realtime.
-
-The feed is generated per request from the `Host` header rather than written to
-disk, so episode URLs always match the address you reached it on. Audio is
-served with byte-range support so seeking works. Cover art is drawn with
-arithmetic and PNG-encoded by hand.
-
-```
-src/
-  wav.js        RIFF parsing, splicing, silence
-  engines.js    say + piper adapters, batched by voice
-  install.js    one-command setup, including the espeak patch
-  tts.js        script → m4a
-  editor.js     source → spoken script, via the claude CLI
-  speakable.js  markdown → text worth hearing
-  cover.js      generated artwork, hand-rolled PNG encoder
-  feed.js       RSS 2.0 + iTunes tags
-  server.js     feed, audio, web player
-  sources/      claude · digest · korean · words · reading
-```
-
-### One thing worth knowing
-
-The published Piper macOS wheel hardcodes its build machine's `espeak-ng-data`
-path into `espeakbridge.so` and ignores the path passed to `initialize()`, so
-phonemization fails everywhere but Rhasspy's CI. No environment variable
-overrides it. `pod setup` copies the bundled data somewhere stable, overwrites
-the baked-in string in place (NUL-padded, since it can't grow), and re-signs the
-library — arm64 refuses to load it otherwise. If a future Piper release fixes
-this, the patch step detects it's unnecessary and skips.
+MIT — see [LICENSE](LICENSE). No models or speech engines are shipped; `pod setup`
+downloads them at install time and they carry their own licences, some of them
+GPL-3.0. See [NOTICE.md](NOTICE.md).

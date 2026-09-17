@@ -9,8 +9,20 @@ export const EPISODES_DIR = path.join(ROOT, 'episodes');
 export const ART_DIR = path.join(ROOT, 'art');
 const MANIFEST = path.join(ROOT, 'episodes.json');
 
+/**
+ * config.json is gitignored — it holds your own voice and lexicon choices — so
+ * a fresh clone has only the example. Fall back to it rather than failing, and
+ * let the real file shadow it once there is one.
+ */
 export async function loadConfig() {
-  return JSON.parse(await readFile(path.join(ROOT, 'config.json'), 'utf8'));
+  for (const name of ['config.json', 'config.example.json']) {
+    try {
+      return JSON.parse(await readFile(path.join(ROOT, name), 'utf8'));
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+  }
+  throw new Error('no config.json or config.example.json found');
 }
 
 export async function loadEpisodes() {

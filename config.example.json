@@ -1,36 +1,35 @@
 {
   "title": "Commute Cast",
   "author": "Your Name",
-  "description": "Korean lessons, vocabulary drills, and things I'd rather listen to than read.",
+  "description": "Things I'd rather listen to than read.",
   "language": "en-us",
   "port": 4000,
   "bitrate": 64000,
   "voices": {
     "narrator": {
-      "engine": "piper",
-      "model": "en_US-lessac-high",
-      "sentenceSilence": 0.28
+      "engine": "kokoro",
+      "voice": "af_bella",
+      "speed": 1
     },
     "host": {
-      "engine": "piper",
-      "model": "en_US-lessac-high",
-      "sentenceSilence": 0.28
+      "engine": "kokoro",
+      "voice": "af_bella",
+      "speed": 1
     },
     "guest": {
-      "engine": "piper",
-      "model": "en_GB-cori-high",
-      "sentenceSilence": 0.28
+      "engine": "kokoro",
+      "voice": "bm_george",
+      "speed": 1
     },
     "en": {
-      "engine": "piper",
-      "model": "en_US-lessac-high",
-      "sentenceSilence": 0.28
+      "engine": "kokoro",
+      "voice": "af_bella",
+      "speed": 1
     },
     "en_slow": {
-      "engine": "piper",
-      "model": "en_US-lessac-high",
-      "sentenceSilence": 0.28,
-      "lengthScale": 1.2
+      "engine": "kokoro",
+      "voice": "af_bella",
+      "speed": 0.8
     },
     "ko": {
       "engine": "piper",
@@ -75,14 +74,10 @@
   },
   "lexicon": {
     "Revo": "Reevo",
-    "Bunnings": "Bunings",
-    "Xiaohongshu": "Shao hong shoo",
-    "Clearview": "Clear view",
-    "KPMG": "K P M G",
-    "EPBCS": "E P B C S",
-    "EDMCS": "E D M C S"
+    "EBITDA": "ee bit dah",
+    "Xiaohongshu": "Shao hong shoo"
   },
   "sync": {
-    "folder": "commute-cast"
+    "folder": "claudecode"
   }
 }

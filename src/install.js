@@ -9,7 +9,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, readFile, writeFile, cp, access, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { PIPER_HOME, piperPython, piperModelDir, piperModel } from './engines.js';
+import { PIPER_HOME, piperPython, piperModelDir, piperModel, KOKORO_HOME, kokoroPython } from './engines.js';
 
 const run = promisify(execFile);
 const exists = (p) => access(p).then(() => true, () => false);
@@ -98,6 +98,51 @@ async function downloadModel(name, index, log) {
   }
   const { size } = await stat(target);
   log(`  ${name} downloaded (${(size / 1048576).toFixed(0)} MB)`);
+}
+
+const KOKORO_RELEASE = 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0';
+
+/**
+ * Kokoro: a far more natural voice than piper, still offline and still free.
+ *
+ * It needs Python 3.10+, which this Mac does not have (system python is 3.9
+ * and there is no Homebrew). `uv` solves that without sudo — it fetches a
+ * standalone CPython into the user's own directory — so the whole install
+ * still touches nothing system-wide and costs nothing.
+ */
+export async function setupKokoro({ log = console.log } = {}) {
+  const uv = path.join(process.env.HOME, '.local', 'bin', 'uv');
+  if (!(await exists(uv))) {
+    log('Installing uv (fetches a private Python, no sudo)…');
+    await run('sh', ['-c', 'curl -LsSf https://astral.sh/uv/install.sh | sh'], { timeout: 10 * 60 * 1000 });
+  } else {
+    log('uv already installed');
+  }
+
+  await mkdir(KOKORO_HOME, { recursive: true });
+  if (!(await exists(kokoroPython()))) {
+    log('Creating a Python 3.12 environment…');
+    await run(uv, ['venv', '--python', '3.12', path.join(KOKORO_HOME, '.venv')], { timeout: 15 * 60 * 1000 });
+  }
+
+  const hasKokoro = await run(kokoroPython(), ['-c', 'import kokoro_onnx']).then(() => true, () => false);
+  if (!hasKokoro) {
+    log('Installing kokoro-onnx…');
+    await run(uv, ['pip', 'install', '--python', kokoroPython(), 'kokoro-onnx', 'soundfile'],
+      { timeout: 25 * 60 * 1000 });
+  } else {
+    log('kokoro-onnx already installed');
+  }
+
+  for (const [file, size] of [['kokoro-v1.0.onnx', '310 MB'], ['voices-v1.0.bin', '27 MB']]) {
+    const dest = path.join(KOKORO_HOME, file);
+    if (await exists(dest)) { log(`  ${file} already downloaded`); continue; }
+    log(`  downloading ${file} (${size})…`);
+    await run('curl', ['-sL', '--fail', '--max-time', '1800', '-o', dest, `${KOKORO_RELEASE}/${file}`],
+      { timeout: 31 * 60 * 1000 });
+  }
+  log('  kokoro ready');
+  return { home: KOKORO_HOME };
 }
 
 export async function fetchVoiceIndex() {
