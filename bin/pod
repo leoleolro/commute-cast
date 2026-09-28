@@ -2,7 +2,7 @@
 // commute-cast — turn anything into a private podcast.
 
 import path from 'node:path';
-import { writeFile, copyFile, mkdir, readdir, unlink, stat, readFile } from 'node:fs/promises';
+import { writeFile, copyFile, mkdir, readdir, unlink, stat, readFile, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -20,6 +20,7 @@ import { coverPng } from '../src/cover.js';
 import { hhmmss } from '../src/feed.js';
 import { serve } from '../src/server.js';
 import { setup, setupKokoro, DEFAULT_MODELS, fetchVoiceIndex } from '../src/install.js';
+import { quotaRemaining, uploadState, waitForUpload, verdict, isInICloud, mb } from '../src/icloud.js';
 import { installedModels, piperInstalled, kokoroInstalled, KOKORO_HOME, kokoroPython } from '../src/engines.js';
 
 const run = promisify(execFile);
@@ -84,6 +85,7 @@ async function publish(spec) {
   await addEpisode({
     id, show: spec.show, title: spec.title, description: spec.description || '',
     file, bytes: size, duration, pubDate: date.toISOString(),
+    ...(spec.series ? { series: spec.series, part: spec.part ?? null, short: spec.short || null } : {}),
   });
 
   console.log(`\r${ok('✓')} ${bold(spec.title)}${' '.repeat(24)}`);
@@ -348,12 +350,19 @@ async function cmdWords() {
  */
 async function cmdBrief() {
   const file = args[0];
-  if (!file || !existsSync(file)) die('Usage: pod brief <script.md> [--title "..."] [--no-sync]');
+  if (!file || !existsSync(file)) die('Usage: pod brief <script.md> [--title "..."] [--show anime] [--series "Name" --part 1 --short "..."] [--no-sync]');
   const id = await publish(await readingEpisode(file, {
     title: typeof flags.title === 'string' ? flags.title : undefined,
     code: 'skip',
-    show: 'brief',
-  }));
+    show: typeof flags.show === 'string' ? flags.show : 'brief',
+  }).then((spec) => ({
+    ...spec,
+    ...(typeof flags.series === 'string' ? {
+      series: flags.series,
+      part: flags.part !== undefined ? Number(flags.part) : null,
+      short: typeof flags.short === 'string' ? flags.short : null,
+    } : {}),
+  })));
   if (flags.sync === undefined && flags['no-sync'] === undefined) await cmdSync();
   return id;
 }
@@ -391,43 +400,181 @@ async function cmdSync(explicitTarget) {
   // iCloud Drive is the only path that reliably lands files in the iPhone's
   // Files app. Podcast apps fetch feeds from their own servers and can never
   // see a LAN feed, so this — not the RSS feed — is the delivery route.
-  const folder = config.sync?.folder || 'claudecode';
+  const folder = config.sync?.folder || 'Commute Cast';
   const defaultTarget = path.join(homedir(), 'Library', 'Mobile Documents', 'com~apple~CloudDocs', folder);
   const target = explicitTarget || (typeof flags.to === 'string' ? flags.to : null) || defaultTarget;
+  const cloud = isInICloud(target);
   if (!episodes.length) die('No episodes to sync yet.');
   await mkdir(target, { recursive: true });
 
-  const wanted = new Map();
-  for (const e of episodes) {
-    const show = (config.shows[e.show]?.title || e.show).replace(/[/:]/g, '-');
-    wanted.set(`${e.pubDate.slice(0, 10)} ${show} — ${e.title.replace(/[/:]/g, '-').slice(0, 60)}.m4a`, e);
-  }
+  const wanted = syncLayout(episodes);
 
-  let copied = 0;
+  if (flags.check) return reportCloudState(target, [...wanted.keys()], cloud);
+
+  // Work out what actually needs copying before touching anything.
+  const pending = [];
+  let renamed = 0;
   for (const [name, e] of wanted) {
     const dest = path.join(target, name);
     const src = path.join(EPISODES_DIR, e.file);
     // Re-rendering an episode keeps its title and date, so the destination
     // name is unchanged. Comparing size and mtime is what makes a re-render
     // actually reach the phone instead of silently being skipped.
+    // An episode synced under the old naming scheme is renamed in place:
+    // a rename costs no upload and no quota, a fresh copy costs both.
+    const legacy = path.join(target, legacyName(e, config));
+    if (!existsSync(dest) && legacy !== dest && existsSync(legacy)) {
+      await mkdir(path.dirname(dest), { recursive: true });
+      await rename(legacy, dest);
+      renamed++;
+    }
     if (existsSync(dest)) {
       const [a, b] = [await stat(src), await stat(dest)];
       if (a.size === b.size && a.mtimeMs <= b.mtimeMs) continue;
     }
-    await copyFile(src, dest);
-    copied++;
+    pending.push({ src, dest, bytes: (await stat(src)).size });
   }
-  if (flags.prune) {
-    for (const name of await readdir(target)) {
-      if (name.endsWith('.m4a') && !wanted.has(name)) await unlink(path.join(target, name));
+
+  // A copy into a full iCloud succeeds locally and then never uploads, so
+  // check for room first and refuse loudly rather than report a fake success.
+  const needed = pending.reduce((n, p) => n + p.bytes, 0);
+  if (cloud) {
+    const free = await quotaRemaining();
+    if (free !== null && needed > free) {
+      die(`iCloud is full: ${mb(free)} free, these episodes need ${mb(needed)}.\n` +
+          `  Nothing was copied — it would never have reached your phone.\n` +
+          `  Free up space in iCloud, or use the podcast feed (pod serve) instead.`);
+    }
+    if (free !== null && free - needed < 200 * 1048576) {
+      console.log(`\x1b[33m! iCloud is nearly full — ${mb(free - needed)} left after this sync.\x1b[0m`);
     }
   }
-  console.log(`${ok('✓')} synced ${copied} new (${wanted.size} total)`);
+
+  for (const p of pending) {
+    await mkdir(path.dirname(p.dest), { recursive: true });
+    await copyFile(p.src, p.dest);
+  }
+  if (renamed) console.log(`${ok('✓')} renamed ${renamed} to the new naming, no re-upload needed`);
+
+  if (flags.prune) {
+    for (const rel of await listAudio(target)) {
+      if (!wanted.has(rel)) await unlink(path.join(target, rel));
+    }
+  }
+
+  if (!pending.length) {
+    console.log(`${ok('✓')} nothing new (${wanted.size} episodes already there)`);
+  } else if (!cloud || flags['no-wait']) {
+    console.log(`${ok('✓')} copied ${pending.length} (${mb(needed)})${cloud ? dim(' — upload not verified (--no-wait)') : ''}`);
+  } else {
+    // Only claim success once iCloud itself says the files are up.
+    const states = await waitForUpload(pending.map((p) => p.dest), {
+      timeoutMs: (Number(flags.wait) || 90) * 1000,
+      onTick: live ? (done, total) => process.stdout.write(`\r  uploading to iCloud… ${done}/${total}   `) : undefined,
+    });
+    if (live) process.stdout.write('\r' + ' '.repeat(40) + '\r');
+    summariseUploads(states, needed);
+  }
+
   console.log(dim(`  ${target}`));
   if (target === defaultTarget) {
-    console.log(dim(`  iPhone: Files → iCloud Drive → ${folder}`));
+    console.log(dim(`  iPhone: Files → iCloud Drive → ${folder.split('/').join(' → ')}`));
     console.log(dim('  Long-press the folder → Keep Downloaded, to hold it on the phone.'));
   }
+}
+
+/**
+ * Where each episode lives on the phone, as paths relative to the sync folder.
+ *
+ * A series gets its own folder, and each part leads with its number, so the
+ * order to listen in is the first thing you read: "Zeta Gundam/0 · Start Here".
+ * One-off episodes sit at the top level under their plain title. Dates and show
+ * names used to lead every file name, which made them too long to read in the
+ * Files app; a date only comes back now to split two episodes with the same
+ * title. Comparison is case-insensitive because APFS is.
+ */
+function syncLayout(episodes) {
+  const clean = (s) => String(s).replace(/:\s*/g, ' — ').replace(/[/\\:]/g, '-').replace(/\s+/g, ' ').trim();
+  const layout = new Map();
+  const taken = new Set();
+  const oldestFirst = [...episodes].sort((a, b) => a.pubDate.localeCompare(b.pubDate));
+  for (const e of oldestFirst) {
+    let rel = e.series
+      ? path.join(clean(e.series), `${e.part ?? ''} · ${clean(e.short || e.title)}.m4a`.replace(/^ · /, ''))
+      : `${clean(e.title).slice(0, 70)}.m4a`;
+    if (taken.has(rel.toLowerCase())) rel = rel.replace(/\.m4a$/, ` (${e.pubDate.slice(0, 10)}).m4a`);
+    taken.add(rel.toLowerCase());
+    layout.set(rel, e);
+  }
+  return layout;
+}
+
+/** The file name the previous version of pod sync gave an episode. */
+function legacyName(e, config) {
+  const show = (config.shows[e.show]?.title || e.show).replace(/[/:]/g, '-');
+  return `${e.pubDate.slice(0, 10)} ${show} — ${e.title.replace(/[/:]/g, '-').slice(0, 60)}.m4a`;
+}
+
+/** Every .m4a under a folder, one level of series folders deep. */
+async function listAudio(root) {
+  const out = [];
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      for (const name of await readdir(path.join(root, entry.name))) {
+        if (name.endsWith('.m4a')) out.push(path.join(entry.name, name));
+      }
+    } else if (entry.name.endsWith('.m4a')) out.push(entry.name);
+  }
+  return out;
+}
+
+function summariseUploads(states, bytes) {
+  const by = (v) => states.filter((s) => s.verdict === v);
+  const up = by('uploaded');
+  const still = by('uploading');
+  const bad = states.filter((s) => ['failed', 'conflict', 'paused', 'unknown'].includes(s.verdict));
+
+  if (up.length === states.length) {
+    console.log(`${ok('✓')} ${up.length} uploaded to iCloud (${mb(bytes)}) — on its way to your phone`);
+    return;
+  }
+  if (up.length) console.log(`${ok('✓')} ${up.length} uploaded`);
+  if (still.length) {
+    console.log(`\x1b[33m… ${still.length} still uploading\x1b[0m — iCloud will finish in the background.`);
+    console.log(dim('  Confirm later with: pod sync --check'));
+  }
+  for (const s of bad) {
+    const why = {
+      failed: `upload failed: ${s.error}`,
+      conflict: 'iCloud has a conflicting version of this file',
+      paused: 'iCloud sync is paused on this Mac',
+      unknown: 'iCloud does not recognise this file yet',
+    }[s.verdict];
+    console.log(`\x1b[31m✗ ${path.basename(s.file)}\n    ${why} — it will NOT reach your phone\x1b[0m`);
+  }
+  if (bad.length) process.exitCode = 1;
+}
+
+async function reportCloudState(target, names, cloud) {
+  if (!cloud) die(`${target} is not in iCloud Drive — nothing to check.`);
+  const free = await quotaRemaining();
+  const files = names.map((n) => path.join(target, n)).filter((f) => existsSync(f));
+  const missing = names.length - files.length;
+  const states = await Promise.all(files.map(async (file) => {
+    const s = await uploadState(file);
+    return { file, ...s, verdict: verdict(s) };
+  }));
+  const count = (v) => states.filter((s) => s.verdict === v).length;
+  console.log(bold('\niCloud delivery check\n'));
+  console.log(`  quota free    ${free === null ? 'unknown' : mb(free)}${free !== null && free < 200 * 1048576 ? '  \x1b[33m(nearly full)\x1b[0m' : ''}`);
+  console.log(`  uploaded      ${count('uploaded')}/${names.length}`);
+  if (count('uploading')) console.log(`  uploading     ${count('uploading')}`);
+  if (missing) console.log(`  not copied    ${missing}  ${dim('(run pod sync)')}`);
+  for (const s of states.filter((x) => !['uploaded', 'uploading'].includes(x.verdict))) {
+    console.log(`\x1b[31m  ✗ ${path.basename(s.file)} — ${s.verdict}${s.error ? `: ${s.error}` : ''}\x1b[0m`);
+  }
+  console.log('');
+  if (states.some((s) => !['uploaded', 'uploading'].includes(s.verdict))) process.exitCode = 1;
 }
 
 async function cmdServe() {
@@ -457,7 +604,7 @@ ${bold('commute-cast')} — turn anything into a private podcast
 
   ${bold('pod list')} · ${bold('pod rm')} <id> · ${bold('pod voices')} ${dim('--all')}
   ${bold('pod voice')} ${dim('--try')}             hear every installed voice, then pick one
-  ${bold('pod serve')} ${dim('--port 4000')} · ${bold('pod sync')} ${dim('[folder] --prune')}
+  ${bold('pod serve')} ${dim('--port 4000')} · ${bold('pod sync')} ${dim('[folder] --prune --check --no-wait')}
 `);
 }
 

@@ -56,16 +56,49 @@ pod claude --sync          # your last Claude Code session, digested
 
 ## Getting it onto a phone
 
-Episodes land in **iCloud Drive → `claudecode`**, which shows up in the Files app.
+Episodes land in **iCloud Drive → `Commute Cast`**, which shows up in the Files app.
 Long-press the folder there and choose *Keep Downloaded* to hold them on the device
 so they play with no signal.
 
 ```bash
-pod sync            # copy everything across
+pod sync            # copy everything across, and wait for iCloud to confirm the upload
+pod sync --check    # is everything actually up? how much quota is left?
 pod sync --prune    # and delete what's no longer in the library
 ```
 
-Change the folder name under `sync.folder` in `config.json`.
+`pod sync` only reports success once iCloud itself says the upload finished — a copy
+into the iCloud folder proves nothing on its own, because the upload happens later and
+can fail silently. It checks your quota first and refuses outright if the episodes
+won't fit, warns when you're under 200 MB, and names any file that hit a conflict or
+an upload error. `--no-wait` skips the wait.
+
+Names are kept short enough to read on a phone. A one-off episode is just its title.
+A series gets its own folder, and each part leads with its number, so the order to
+listen in is the first thing you see:
+
+```
+Commute Cast/
+├── Zeta Gundam/
+│   ├── 0 · Start Here.m4a
+│   ├── 1 · Heirs to the Stars.m4a
+│   └── …
+└── Revo Fitness — Business Briefing.m4a
+```
+
+Make an episode part of a series when you render it:
+
+```bash
+pod brief part1.md --title "Zeta Gundam 1 — Heirs to the Stars" \
+  --series "Zeta Gundam" --part 1 --short "Heirs to the Stars"
+```
+
+Upgrading from an older layout renames the files already in iCloud in place, so
+nothing is uploaded twice.
+
+Change the folder under `sync.folder` in `config.json`. It can be nested —
+`"Claude Code/Commute Cast"` keeps it inside a Claude Code folder. Don't pick a
+name that differs from another folder only by capitals: your Mac treats `claudecode`
+and `Claudecode` as the same folder, iCloud's servers don't, and it will split them.
 
 This is the route that works. Podcast apps like Overcast and Pocket Casts fetch
 feeds from *their* servers, so they can never reach a feed served from your laptop.
